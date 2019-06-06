@@ -2,6 +2,7 @@
 
 (in-package #:cl-opencensus)
 
+(declaim (optimize (debug 3)))
 (defun very-random ()
   "returns a 64bit random number from /dev/urandom which is more randomer than random, apparently."
   (with-open-file (file #P"/dev/urandom" :element-type '(unsigned-byte 8))
@@ -13,7 +14,7 @@
   ((data :initform nil :initarg :data :accessor span-data)
    (lock :initform (bt:make-lock) :accessor span-lock)
    (exported :initform nil :accessor span-exported)
-   (span-context :initform nil :accessor span-context)
+   (span-context :accessor span-context :initform nil)
    (attributes :initform nil :accessor span-attributes)
    (annotations :initform nil :accessor span-annotations)
    (message-events :initform nil :accessor message-events)
@@ -106,6 +107,7 @@
     (let ((s (make-instance 'span)))
       (setf (span-context s) parent)
       (unless parent
+        (setf (span-context s) (make-instance 'span-context))
         (setf (span-context-trace-id  (span-context s)) (next-trace-id)))
       (setf (span-context-span-id (span-context s)) (next-span-id))
       (setf (span-data s) (make-instance 'span-data
@@ -133,8 +135,7 @@
     (setf (opencensus.proto.trace.v1:start-time pspan) (start-time (span-data s)))
     (setf (opencensus.proto.trace.v1:end-time pspan) (end-time (span-data s)))
     (setf (opencensus.proto.trace.v1:child-span-count pspan) (child-span-count (span-data s)))
-    pspan
-    ))
+    pspan))
 
 (defun finish-span ()
   (unless *current-span*
@@ -143,13 +144,14 @@
     (unless (span-exported *current-span*)
       (if (sampled-p (span-context *current-span*))
           (setf (span-data-end-time (span-data *current-span*)) (local-time:now))
-          (export-span  *current-span*)) ;; serialize in the output thread to avoid tracing overhead
+          (export-span *current-span*)) ;; serialize in the output thread to avoid tracing overhead
       (setf (span-exported *current-span*) t))))
 (export 'finish-span)
 
 (defmacro with-span (name &body body)
   `(let ((*current-span* (make-span ,name)))
      (unwind-protect
-          (progn ,@body)
+          (progn
+            ,@body)
        (finish-span))))
 (export 'with-span)

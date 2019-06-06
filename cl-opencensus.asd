@@ -10,6 +10,7 @@
                #:cl-intbytes
                #:atomics
                #:local-time
+               #:drakma
                #:protobuf
                #:bordeaux-threads)
   :in-order-to ((test-op (test-op "cl-opencensus-test")))

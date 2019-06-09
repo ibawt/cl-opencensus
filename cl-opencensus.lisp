@@ -2,50 +2,12 @@
 
 (in-package #:cl-opencensus)
 
-(declaim (optimize (debug 3)))
 (defun very-random ()
   "returns a 64bit random number from /dev/urandom which is more randomer than random, apparently."
   (with-open-file (file #P"/dev/urandom" :element-type '(unsigned-byte 8))
     (let ((buf (make-array 8 :element-type '(unsigned-byte 8))))
       (read-sequence buf file)
       (logand (intbytes:octets->uint64 buf) most-positive-fixnum))))
-
-(defclass span (base)
-  ((data :initform nil :initarg :data :accessor span-data)
-   (lock :initform (bt:make-lock) :accessor span-lock)
-   (exported :initform nil :accessor span-exported)
-   (span-context :accessor span-context :initform nil)
-   (attributes :initform nil :accessor span-attributes)
-   (annotations :initform nil :accessor span-annotations)
-   (message-events :initform nil :accessor message-events)
-   (links :initform nil :accessor span-links)))
-(export 'span)
-
-(defmethod print-object ((s span) stream)
-  (with-slots (data span-context attributes annotations message-events links) s
-    (format stream "Span[data=~a, span-context: ~a, attributes: ~a, annotations: ~a, message-events: ~a, links: ~a]"
-            data span-context attributes annotations message-events links)))
-
-(defclass span-context (base)
-  ((trace-id :accessor span-context-trace-id)
-   (span-id :accessor span-context-span-id) trace-options trace-state))
-
-(defclass span-data (base)
-  ((parent-span-id :accessor span-data-parent-span-id)
-   (span-context :initarg :span-context)
-   (span-kind :initarg :span-kind :accessor span-data-span-kind)
-   (name :initarg :name :type string :accessor span-data-name)
-   (start-time :initform (local-time:now) :accessor start-time)
-   (end-time :accessor span-data-end-time :accessor end-time)
-   attributes
-   annotations message-events status
-   links
-   (has-remote-parent :initarg :has-remote-parent :type boolean)
-   (dropped-attribute-count :initform 0 :type fixnum)
-   (dropped-annotation-count :initform 0 :type fixnum)
-   (dropped-message-event-count :initform 0 :type fixnum)
-   (dropped-link-count :initform 0 :type fixnum)
-   (child-span-count :initform 0 :type fixnum :accessor child-span-count)))
 
 (atomics:defstruct atomic-integer
   (value 0 :type #-sbcl fixnum #+sbcl sb-ext:word))
@@ -62,6 +24,9 @@
     (format stream "IdGenerator[next-span-id: ~a, span-id-inc: ~a, trace-id-add: ~a]"
             (atomic-integer-value (slot-value id 'next-span-id))
             (slot-value id 'span-id-inc) (slot-value id 'trace-id-add))))
+
+(defun default-sampler ()
+  (always-sample))
 
 (defun make-id-generator ()
   (let ((idg (make-instance 'id-generator)))
@@ -99,28 +64,6 @@
   (bt:with-lock-held ((slot-value s 'lock))
     (incf (slot-value (span-data s) 'child-span-count))))
 
-(defun make-span (name &key (span-kind :unspecified) (has-remote-parent nil))
-  (let ((parent))
-    (when *current-span*
-      (add-child *current-span*)
-      (setf parent (span-context *current-span*)))
-    (let ((s (make-instance 'span)))
-      (setf (span-context s) parent)
-      (unless parent
-        (setf (span-context s) (make-instance 'span-context))
-        (setf (span-context-trace-id  (span-context s)) (next-trace-id)))
-      (setf (span-context-span-id (span-context s)) (next-span-id))
-      (setf (span-data s) (make-instance 'span-data
-                                         ;; how do we get span context in here
-                                         :span-context parent
-                                         :span-kind span-kind
-                                         :name name
-                                         :has-remote-parent has-remote-parent))
-
-      (when parent
-        (setf (span-data-parent-span-id (span-data s)) (span-context-span-id parent)))
-      s)))
-(export 'make-span)
 
 (defmethod sampled-p ((p span-context))
   t)
@@ -141,17 +84,64 @@
   (unless *current-span*
     (error "no spans to finish!"))
   (bt:with-lock-held ((span-lock *current-span*))
-    (unless (span-exported *current-span*)
-      (if (sampled-p (span-context *current-span*))
-          (setf (span-data-end-time (span-data *current-span*)) (local-time:now))
-          (export-span *current-span*)) ;; serialize in the output thread to avoid tracing overhead
-      (setf (span-exported *current-span*) t))))
+    (if (span-exported *current-span*)
+        (error "span already exported")
+        (progn
+          (when (sampled-p (span-context *current-span*))
+            (setf (span-data-end-time (span-data *current-span*)) (local-time:now))
+            (export-span *current-exporter* *current-span*)) ;; serialize in the output thread to avoid tracing overhead
+          (setf (span-exported *current-span*) t)))))
 (export 'finish-span)
 
-(defmacro with-span (name &body body)
-  `(let ((*current-span* (make-span ,name)))
+(defun make-span (name &key (remote-parent nil) (span-kind :unspecified) (parent-span-context nil) (sampler nil))
+  "creates a span instance"
+  (let ((parent parent-span-context))
+    (when *current-span*
+      (add-child *current-span*)
+      (setf parent (span-context *current-span*)))
+    (let ((s (make-instance 'span)))
+      (setf (span-context s) parent)
+      (unless parent
+        (setf (span-context s) (make-instance 'span-context))
+        (setf (span-context-trace-id  (span-context s)) (next-trace-id)))
+      (setf (span-context-span-id (span-context s)) (next-span-id))
+
+      (when (or (not parent-span-context) remote-parent sampler)
+        (setf (sampled-p (span-context s)) (sample (or sampler (default-sampler))
+                                                   (make-instance 'sampling-parameters
+                                                                  :parent-context parent
+                                                                  :trace-id (trace-id (span-context s))
+                                                                  :span-id (span-id (span-context s))
+                                                                  :name name
+                                                                  :has-remote-parent remote-parent))))
+      (when (sampled-p (span-context s))
+        (setf (span-data s) (make-instance 'span-data
+                                           :span-context parent
+                                           :span-kind span-kind
+                                           :name name
+                                           :has-remote-parent remote-parent))
+        (setf (attributes s) (make-instance 'attribute-map :max-count (max-attributes-per-span *config*)))
+        (setf (annotations s) (make-ring-buffer (max-annotations-events-per-span *config*)))
+        (setf (message-events s) (make-ring-buffer (max-message-events-per-span *config*)))
+        (setf (links s) (make-ring-buffer (max-links-per-span *config*))))
+      (when parent
+        (setf (span-data-parent-span-id (span-data s)) (span-context-span-id parent)))
+      s)))
+(export 'make-span)
+
+(defmacro with-span (name (&optional (parent-context nil) (kind :unspecified) (sampler nil) (remote-parent nil)) &body body)
+  `(let ((*current-span* (make-span ,name :parent-span-context ,parent-context
+                                          :remote-parent ,remote-parent
+                                          :span-kind ,kind
+                                          :sampler ,sampler)))
      (unwind-protect
           (progn
             ,@body)
        (finish-span))))
 (export 'with-span)
+
+(defun add-attributes (&rest attrs)
+  (bt:with-lock-held ((span-lock *current-span*))
+    (loop for a in attrs
+          do (attribute-map-add (attributes *current-span*) (car a) (cadr a)))))
+(export 'add-attributes)

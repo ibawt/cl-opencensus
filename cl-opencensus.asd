@@ -28,5 +28,8 @@
                (:file "proto/trace")
                (:file "proto/trace_service")
                (:file "base")
+               (:file "sampler")
+               (:file "lrumap")
+               (:file "log")
                (:file "exporter")
                (:file "cl-opencensus")))

@@ -4,8 +4,9 @@
 (fiveam:in-suite opencensus-tests)
 
 (defmacro with-http-server (handler &body body)
-  `(let ((server (clack:clackup ,handler :port 55678)))
-     (unwind-protect (progn ,@body)
+  `(let ((server (clack:clackup ,handler :port 55678 :debug t)))
+     (unwind-protect (progn ,@body
+                            (sleep 0.2)) ;; clack has a race condition :(
        (clack:stop server))))
 
 (fiveam:test ring-buffer-test
@@ -55,3 +56,14 @@
       (fiveam:is (equalp (span-id (car spans)) (parent-span-id (cadr spans))))
       (fiveam:is (= 1 (child-span-count root)))
       (fiveam:is (equalp (trace-id root) (trace-id child))))))
+
+(fiveam:test test-exporter
+  (with-http-server (lambda (env)
+                      '(200 () "OK"))
+    (with-exporter
+      (with-span "bar" ()
+        (+ 1 2)
+        )
+      )
+    )
+  )

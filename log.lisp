@@ -9,7 +9,7 @@
 
 (defclass logger (base)
   ((lock :initform (bt:make-lock) :accessor logger-lock)
-   (level :initform :info :initarg :level :accessor logger-level)
+   (level :initform +debug+ :initarg :level :accessor logger-level)
    (stream :initarg :stream :initform *standard-output* :accessor logger-stream)))
 (export 'logger)
 
@@ -38,11 +38,10 @@
 (export 'log/debug)
 
 (defun logz (level fmt &rest rest)
-  (when (>= level (logger-level *current-logger*))
     (with-accessors ((stream logger-stream))
         *current-logger*
       (bt:with-lock-held ((logger-lock *current-logger*))
         (format stream "[~a]: " level)
         (apply #'format stream fmt rest)
         (format stream "~%")
-        (finish-output)))))
+        (finish-output))))

@@ -1,6 +1,7 @@
 ;;;; cl-opencensus.lisp
 
 (in-package #:cl-opencensus)
+(declaim (optimize (debug 3)))
 
 (defun very-random ()
   "returns a 64bit random number from /dev/urandom which is more randomer than random, apparently."
@@ -24,9 +25,6 @@
     (format stream "IdGenerator[next-span-id: ~a, span-id-inc: ~a, trace-id-add: ~a]"
             (atomic-integer-value (slot-value id 'next-span-id))
             (slot-value id 'span-id-inc) (slot-value id 'trace-id-add))))
-
-(defun default-sampler ()
-  (always-sample))
 
 (defun make-id-generator ()
   (let ((idg (make-instance 'id-generator)))
@@ -61,24 +59,36 @@
 (export '*current-span*)
 
 (defmethod add-child ((s span))
-  (bt:with-lock-held ((slot-value s 'lock))
-    (incf (slot-value (span-data s) 'child-span-count))))
-
-
-(defmethod sampled-p ((p span-context))
-  t)
+  (bt:with-lock-held ((span-lock s))
+    (incf (child-span-count (span-data s)))))
 
 (defmethod span->protobuf ((s span))
   (let ((pspan (make-instance 'opencensus.proto.trace.v1:span)))
-    (setf (opencensus.proto.trace.v1:trace-id pspan) (span-context-trace-id (span-context s)))
-    (setf (opencensus.proto.trace.v1:span-id pspan) (span-context-span-id (span-context s)))
-    (setf (opencensus.proto.trace.v1:parent-span-id pspan) (span-data-parent-span-id (span-data s)))
-    (setf (opencensus.proto.trace.v1:name pspan) (span-data-name (span-data s)))
-    (setf (opencensus.proto.trace.v1:kind pspan) (span-data-span-kind (span-data s)))
+    (setf (opencensus.proto.trace.v1:trace-id pspan) (trace-id (span-context s)))
+    (setf (opencensus.proto.trace.v1:span-id pspan) (span-id (span-context s)))
+    (setf (opencensus.proto.trace.v1:parent-span-id pspan) (parent-span-id (span-data s)))
+    (setf (opencensus.proto.trace.v1:name pspan) (name (span-data s)))
+    (setf (opencensus.proto.trace.v1:kind pspan) (span-kind (span-data s)))
     (setf (opencensus.proto.trace.v1:start-time pspan) (start-time (span-data s)))
     (setf (opencensus.proto.trace.v1:end-time pspan) (end-time (span-data s)))
     (setf (opencensus.proto.trace.v1:child-span-count pspan) (child-span-count (span-data s)))
     pspan))
+
+(defun make-span-data (s)
+  (let ((sd (span-data s)))
+    (setf (dropped-attribute-count sd) (dropped-count (attributes s)))
+    (setf (attributes sd) (attribute-map->list (attributes s)))
+
+    (setf (dropped-annotation-count sd) (dropped-count (annotations s)))
+    (setf (annotations sd) (ring-buffer->list (annotations s)))
+
+    (setf (dropped-message-event-count sd) (dropped-count (annotations s)))
+    (setf (message-events sd) (ring-buffer->list (message-events s)))
+
+    (setf (dropped-link-count sd) (dropped-count (links s)))
+    (setf (links sd) (ring-buffer->list (links s)))
+
+    sd))
 
 (defun finish-span ()
   (unless *current-span*
@@ -88,10 +98,14 @@
         (error "span already exported")
         (progn
           (when (sampled-p (span-context *current-span*))
-            (setf (span-data-end-time (span-data *current-span*)) (local-time:now))
-            (export-span *current-exporter* *current-span*)) ;; serialize in the output thread to avoid tracing overhead
-          (setf (span-exported *current-span*) t)))))
+            (setf (end-time (span-data *current-span*)) (local-time:now))
+            (export-span *current-exporter* (make-span-data *current-span*)))
+          (setf (span-exported *current-span*) t)
+          (setf (span-data *current-span*) nil)))))
 (export 'finish-span)
+
+(defmethod recording-events-p ((s span))
+  (not (not (span-data s))))
 
 (defun make-span (name &key (remote-parent nil) (span-kind :unspecified) (parent-span-context nil) (sampler nil))
   "creates a span instance"
@@ -103,11 +117,11 @@
       (setf (span-context s) parent)
       (unless parent
         (setf (span-context s) (make-instance 'span-context))
-        (setf (span-context-trace-id  (span-context s)) (next-trace-id)))
-      (setf (span-context-span-id (span-context s)) (next-span-id))
+        (setf (trace-id  (span-context s)) (next-trace-id)))
+      (setf (span-id (span-context s)) (next-span-id))
 
       (when (or (not parent-span-context) remote-parent sampler)
-        (setf (sampled-p (span-context s)) (sample (or sampler (default-sampler))
+        (setf (sampled-p (span-context s)) (sample (or sampler (default-sampler *config*))
                                                    (make-instance 'sampling-parameters
                                                                   :parent-context parent
                                                                   :trace-id (trace-id (span-context s))
@@ -116,7 +130,7 @@
                                                                   :has-remote-parent remote-parent))))
       (when (sampled-p (span-context s))
         (setf (span-data s) (make-instance 'span-data
-                                           :span-context parent
+                                           :span-context (span-context s)
                                            :span-kind span-kind
                                            :name name
                                            :has-remote-parent remote-parent))
@@ -125,11 +139,13 @@
         (setf (message-events s) (make-ring-buffer (max-message-events-per-span *config*)))
         (setf (links s) (make-ring-buffer (max-links-per-span *config*))))
       (when parent
-        (setf (span-data-parent-span-id (span-data s)) (span-context-span-id parent)))
+        (setf (parent-span-id (span-data s)) (span-id parent)))
       s)))
 (export 'make-span)
 
-(defmacro with-span (name (&optional (parent-context nil) (kind :unspecified) (sampler nil) (remote-parent nil)) &body body)
+(defmacro with-span (name (&optional (parent-context nil)
+                             (kind :unspecified) (sampler nil)
+                             (remote-parent nil)) &body body)
   `(let ((*current-span* (make-span ,name :parent-span-context ,parent-context
                                           :remote-parent ,remote-parent
                                           :span-kind ,kind
@@ -141,7 +157,29 @@
 (export 'with-span)
 
 (defun add-attributes (&rest attrs)
-  (bt:with-lock-held ((span-lock *current-span*))
+  (when (recording-events-p *current-span*)
     (loop for a in attrs
           do (attribute-map-add (attributes *current-span*) (car a) (cadr a)))))
 (export 'add-attributes)
+
+(defun add-annotation (attributes fmt &rest rest)
+  (when (recording-events-p *current-span*)
+    (let ((t1 (local-time:now))
+          (s (apply #'format nil fmt rest)))
+      (let ((a (make-instance 'annotation :timestamp t1
+                                          :message s :attributes attributes)))
+        (ring-buffer-push (annotations *current-span*) a)))))
+(export 'add-annotation)
+
+(defun add-message-event (message-id uncompressed-byte-size compressed-byte-size type)
+  (when (recording-events-p *current-span*)
+    (let ((t1 (local-time:now)))
+      (ring-buffer-push (message-events *current-span*)
+                        (make-instance 'message-event
+                                       :message-id message-id
+                                       :timestamp t1
+                                       :event-type type
+                                       :uncompressed-byte-size uncompressed-byte-size
+                                       :compressed-byte-size compressed-byte-size)))))
+(export 'add-message-event)
+

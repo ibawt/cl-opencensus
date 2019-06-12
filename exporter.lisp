@@ -1,8 +1,6 @@
 (in-package #:cl-opencensus)
 
 (defconstant +buffer-size+ 512)
-(defconstant +flush-interval+ (* internal-time-units-per-second 60))
-(defconstant +max-fails-per-flush+ 5)
 
 (defvar *exporter-url* "http://127.0.0.1:55678")
 (defvar *current-exporter* nil)
@@ -13,7 +11,8 @@
    (running :initform t :type boolean :accessor exporter-running)
    (wakeup :initform (bt:make-condition-variable) :reader wakeup)
    (thread :initarg :thread :accessor exporter-thread)
-   (buffer :initform (make-ring-buffer +buffer-size+) :accessor exporter-buffer)))
+   (input-buffer :initform (make-ring-buffer +buffer-size+) :accessor input-buffer :documentation "contains span-data")
+   (output-buffer :initform (make-ring-buffer +buffer-size+) :accessor output-buffer :documentation "contains pb spans")))
 (export 'exporter)
 
 (defclass debug-exporter (exporter)
@@ -54,78 +53,84 @@
   (bt:with-lock-held ((exporter-lock *current-exporter*))
     (exporter-running *current-exporter*)))
 
-(defun fetch-bundle ()
-  (bt:with-lock-held ((exporter-lock *current-exporter*))
-    (loop for s = (ring-buffer-pop (exporter-buffer *current-exporter*))
-          while s
-          collect s)))
+(defconstant +flush-interval+ (* internal-time-units-per-second 60))
 
-(defun spans->protobuf (spans)
-  (make-array (length spans)
-              :element-type 'opencensus.proto.trace.v1:span
-              :initial-contents (mapcar #'span->protobuf spans)))
+(defun fill-output-buffer ()
+  (loop for x = (ring-buffer-pop (input-buffer *current-exporter*))
+        while x
+        do (ring-buffer-push (output-buffer *current-exporter*) (span->protobuf x))))
+
+(defconstant +max-octets-per-bundle+ (* 1024 1024))
+
+(defun fetch-bundle ()
+  (let* ((len 0)
+         (bundle (loop with octet-sum = 0
+                       for s = (ring-buffer-pop (input-buffer *current-exporter*))
+                       while (and s (< octet-sum +max-octets-per-bundle+))
+                       do (setf octet-sum (+ (pb:octet-size s) octet-sum))
+                       do (incf len)
+                       collect s)))
+    (make-array len :element-type 'opencensus.proto.trace.v1:span
+                :initial-contents bundle)))
 
 (defun make-trace-service-request (spans)
   (let ((export-request (make-instance 'opencensus.proto.agent.trace.v1:export-trace-service-request)))
-    (setf (opencensus.proto.agent.trace.v1:spans export-request)
-          (spans->protobuf spans))
+    (setf (opencensus.proto.agent.trace.v1:spans export-request) spans)
     export-request))
 
 (defun serialize-protobuf (pb)
   (let* ((size (pb:octet-size pb))
-        (buf (make-array size :element-type '(unsigned-byte 8) :fill-pointer 0)))
+         (buf (make-array size :element-type '(unsigned-byte 8))))
     (pb:serialize pb buf 0 size)
     buf))
 
+(defconstant +max-fails-per-flush+ 5)
 
 (defun flush-buffer ()
-  (let ((bundles (fetch-bundle))
-        (fails 0))
-    (loop :while bundles
-          :until (> fails +max-fails-per-flush+)
-          :finally (when bundles
-                     (bt:with-lock-held ((exporter-lock *current-exporter*))
-                      (dolist (b bundles) (ring-buffer-push (exporter-buffer *current-exporter*) b))))
-          :do (let* ((bundle (pop bundles))
-                     (buf (when bundle (serialize-protobuf bundle))))
-                (unless bundle (return))
-                (handler-case
-                    (multiple-value-bind (body status-code)
-                        (drakma:http-request *exporter-url*
-                                             :method :post
-                                             :content-type "application/protobuf"
-                                             :content buf)
-                      (case (floor (/ status-code 100))
-                        (2 (let ((r (make-instance 'opencensus.proto.agent.trace.v1:export-trace-service-response)))
-                             (pb:merge-from-array r body 0 (length body))
-                             (setf fails 0)))
-                        (otherwise
-                         (progn
-                           (push bundle bundles)
-                           (incf fails)))))
-                  (drakma:drakma-error (e)
-                    (incf fails)
-                    (push bundle bundles)
-                    (log/error "caught error in flush: ~a" e)))
-                (when (> fails 0)
+  (let ((bundle (fetch-bundle)))
+    (when bundle
+      (let ((req-buffer (serialize-protobuf (make-trace-service-request bundle)))
+            (fails 0))
+        (loop :until (> fails +max-fails-per-flush+)
+              :do (handler-case
+                      (multiple-value-bind (body status-code)
+                          (drakma:http-request *exporter-url*
+                                               :method :post
+                                               :content-type "application/protobuf"
+                                               :content req-buffer)
+                        (case (floor (/ status-code 100))
+                          (2 (let ((r (make-instance 'opencensus.proto.agent.trace.v1:export-trace-service-response)))
+                               (pb:merge-from-array r body 0 (length body))
+                               (return r)))
+                          (otherwise
+                           (incf fails))))
+                    (drakma:drakma-error (e)
+                      (incf fails)
+                      (log/error "caught error in flush: ~a" e)))
                   (sleep (+ (random 0.5) (* 0.20 fails fails))))))))
 
-(defmethod export-span ((e debug-exporter) (span span))
+(defun buffer-needs-flushing-p ()
+  (cond
+    ((> (ring-buffer-length (output-buffer *current-exporter*)) 0) t)
+    ((> (ring-buffer-length (input-buffer *current-exporter*)) 0) t)
+    (t nil)))
+
+(defmethod export-span ((e debug-exporter) (span span-data))
   (with-exporter-lock e
     (push span (spans e))))
 
-(defmethod export-span ((e exporter)(span span))
-  (with-exporter-lock e
-    (ring-buffer-push (exporter-buffer e) span)))
+(defmethod export-span ((e exporter)(span span-data))
+  (ring-buffer-push (input-buffer e) span))
 
 (defun run-exporter ()
   (let ((*random-state* (make-random-state t)))
     (loop :while (exporter-running-p)
           :do (let ((t1 (get-internal-real-time)))
+                (fill-output-buffer)
                 (flush-buffer)
                 (let* ((t2 (- (get-internal-real-time) t1) )
                        (sleep (float (/ (max 0 (- +flush-interval+ t2)) internal-time-units-per-second))))
-                  (if (> sleep 0)
+                  (if (and (not (buffer-needs-flushing-p)) (> sleep 0))
                       (with-exporter-lock *current-exporter*
                           (bt:condition-wait (wakeup *current-exporter*) (exporter-lock *current-exporter*) :timeout sleep))
                       (bt:thread-yield)))))))

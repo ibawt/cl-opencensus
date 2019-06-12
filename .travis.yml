@@ -11,5 +11,4 @@ install:
   - curl https://raw.githubusercontent.com/luismbo/cl-travis/master/install.sh | bash
 
 script:
-  - cl -l fiveam
-       -l test/ci.lisp
+  - cl -l test/ci.lisp

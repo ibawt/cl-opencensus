@@ -119,7 +119,7 @@
   (with-exporter-lock e
     (push span (spans e))))
 
-(defmethod export-span ((e exporter)(span span-data))
+(defmethod export-span ((e exporter) (span span-data))
   (ring-buffer-push (input-buffer e) span))
 
 (defun run-exporter ()

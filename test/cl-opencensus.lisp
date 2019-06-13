@@ -59,7 +59,7 @@
 
 (fiveam:test test-exporter
   (with-http-server (lambda (env)
-                      '(200 () "OK"))
+                      '(200 () ("OK")))
     (with-exporter
       (with-span "bar" ()
         (+ 1 2)

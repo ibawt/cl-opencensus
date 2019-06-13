@@ -14,4 +14,4 @@ install:
   curl -L https://raw.githubusercontent.com/roswell/roswell/release/scripts/install-for-ci.sh | sh
 
 script:
-  - ros run -q -l test/ci.lisp
+  - ros test/ci.lisp

@@ -1,5 +1,6 @@
 # cl-opencensus
-### _Your Name <your.name@example.com>_
+
+[![Build Status](https://travis-ci.org/ibawt/cl-opencensus.svg?branch=master)](https://travis-ci.org/ibawt/cl-opencensus)
 
 This is a project to do ... something.
 

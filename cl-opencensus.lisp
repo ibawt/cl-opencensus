@@ -62,7 +62,7 @@
   (bt:with-lock-held ((span-lock s))
     (incf (child-span-count (span-data s)))))
 
-(defmethod span->protobuf ((s span))
+(defmethod span->protobuf ((s span-data))
   (let ((pspan (make-instance 'opencensus.proto.trace.v1:span)))
     (setf (opencensus.proto.trace.v1:trace-id pspan) (trace-id (span-context s)))
     (setf (opencensus.proto.trace.v1:span-id pspan) (span-id (span-context s)))

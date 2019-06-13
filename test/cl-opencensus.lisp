@@ -16,7 +16,7 @@
     (ring-buffer-push rb 2)
     (ring-buffer-push rb 3)
     (fiveam:is (equalp '(1 2 3) (ring-buffer->list rb)))
-    (fiveam:is (= 4 (dropped-count rb)))))
+    (fiveam:is (= 1 (dropped-count rb)))))
 
 (fiveam:test attribute-map-test
   (let ((a (make-instance 'attribute-map :max-count 1)))
